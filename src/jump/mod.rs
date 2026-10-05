@@ -14,6 +14,8 @@ mod cmux;
 #[cfg(target_os = "macos")]
 mod iterm2;
 mod tmux;
+#[cfg(target_os = "windows")]
+mod wt;
 
 use crate::app::JumpOutcome;
 use std::collections::HashMap;
@@ -67,9 +69,21 @@ pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
 }
 
 /// The registry: the single ordered source of truth for supported terminals.
-/// Non-macOS builds exclude the iTerm2 adapter so standalone Linux/Windows
-/// sessions no-op cleanly instead of trying macOS-only `osascript`.
-#[cfg(not(target_os = "macos"))]
+/// Windows Terminal goes last: it claims any process hosted in one of its
+/// tabs, including a multiplexer running inside it.
+#[cfg(target_os = "windows")]
+pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
+    vec![
+        Box::new(cmux::CmuxJumper),
+        Box::new(tmux::TmuxJumper),
+        Box::new(wt::WindowsTerminalJumper),
+    ]
+}
+
+/// The registry: the single ordered source of truth for supported terminals.
+/// Linux builds exclude the emulator adapters so standalone sessions no-op
+/// cleanly instead of trying macOS-only `osascript`.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![Box::new(cmux::CmuxJumper), Box::new(tmux::TmuxJumper)]
 }
@@ -110,6 +124,20 @@ fn interpret_osascript(stdout: &str) -> JumpAttempt {
         JumpAttempt::Jumped
     } else {
         JumpAttempt::NotApplicable
+    }
+}
+
+/// Map the `wt.ps1` marker line to a jump attempt. Any other marker means the
+/// process is not hosted in a Windows Terminal tab.
+#[cfg(any(test, target_os = "windows"))]
+fn interpret_wt_helper(stdout: &str) -> JumpAttempt {
+    match stdout.trim() {
+        "JUMPED" => JumpAttempt::Jumped,
+        "NOMATCH" => JumpAttempt::Failed(
+            "no tab title matches the session (unfocused pane or renamed tab?)".to_string(),
+        ),
+        "AMBIGUOUS" => JumpAttempt::Failed("several tabs share the session's title".to_string()),
+        _ => JumpAttempt::NotApplicable,
     }
 }
 
@@ -324,11 +352,39 @@ mod tests {
 
     #[test]
     fn jumpers_include_platform_backends() {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(jumpers().len(), 3);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(jumpers().len(), 2);
+    }
+
+    // ---- interpret_wt_helper ----
+
+    #[test]
+    fn interpret_wt_helper_jumped() {
+        assert_eq!(interpret_wt_helper("JUMPED\r\n"), JumpAttempt::Jumped);
+    }
+
+    #[test]
+    fn interpret_wt_helper_unmatched_tab_is_failed() {
+        assert!(matches!(
+            interpret_wt_helper("NOMATCH\r\n"),
+            JumpAttempt::Failed(_)
+        ));
+        assert!(matches!(
+            interpret_wt_helper("AMBIGUOUS\r\n"),
+            JumpAttempt::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn interpret_wt_helper_other_host_is_not_applicable() {
+        assert_eq!(
+            interpret_wt_helper("NOTAPPLICABLE\r\n"),
+            JumpAttempt::NotApplicable
+        );
+        assert_eq!(interpret_wt_helper(""), JumpAttempt::NotApplicable);
     }
 
     // ---- find_pane_target (tmux) ----

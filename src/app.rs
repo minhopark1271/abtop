@@ -796,7 +796,8 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's agent process.
-    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2 /
+    /// Windows Terminal);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
     pub fn jump_to_session(&mut self) -> JumpOutcome {

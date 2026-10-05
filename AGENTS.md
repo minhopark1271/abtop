@@ -274,7 +274,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
-| `Enter` | Jump to session terminal (cmux / tmux / iTerm2) |
+| `Enter` | Jump to session terminal (cmux / tmux / iTerm2 / Windows Terminal) |
 | `x` | Kill selected session (SIGKILL) |
 | `X` | Kill all orphan ports |
 | `q` | Quit |
@@ -364,7 +364,7 @@ Each adapter returns a three-way `JumpAttempt`:
 - `Failed(msg)` — this backend owns the process but the focus command errored;
   stop and surface `"<backend>: <msg>"` in the status line.
 
-Order (most specific first), mutually exclusive by controlling tty:
+Order (most specific first), mutually exclusive by controlling tty or platform:
 
 1. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` (a UUID cmux exports
    into every surface, inherited by the agent) from the process environment via
@@ -377,9 +377,17 @@ Order (most specific first), mutually exclusive by controlling tty:
    then AppleScript selects the session whose `tty` matches and brings its
    window/app to the front. First call triggers a one-time macOS Automation
    permission prompt; until granted, `osascript` exits non-zero → `Failed`.
+4. **Windows Terminal** (`jump/wt.rs`, Windows only) — Windows Terminal cannot
+   focus a tab by PID, so a PowerShell helper (`jump/wt.ps1`) attaches to the
+   agent's console to read its title, takes the hosting window from the parent
+   of the pane's hidden ConPTY window, then selects the tab with the same title
+   via UI Automation. Titles are compared without the leading status glyph that
+   agents animate. A tab shows only its focused pane's title, so an unfocused
+   split pane, a renamed tab, or a duplicated title → `Failed`. Each jump pays
+   ~1s of PowerShell startup.
 
 Parsing/registry logic is unit-tested in `jump/mod.rs`; the thin `ps`/`osascript`/
-`tmux` I/O wrappers are verified manually.
+`tmux`/`powershell` I/O wrappers are verified manually.
 
 ## Privacy
 

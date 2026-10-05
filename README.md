@@ -73,7 +73,7 @@ display name. No additional configuration is required.
 
 ### Terminal Jump
 
-Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
+Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, iTerm2 on macOS, and Windows Terminal. On Windows Terminal the tab is found by its title, so a session in an unfocused split pane or a renamed tab cannot be focused.
 
 ```bash
 tmux new -s work
