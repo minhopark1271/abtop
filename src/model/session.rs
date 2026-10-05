@@ -168,6 +168,8 @@ pub struct AgentSession {
     pub launch_surface: LaunchSurface,
     pub pid: u32,
     pub session_id: String,
+    /// User-assigned name (Claude Code or Codex `/rename`), when available.
+    pub session_name: Option<String>,
     pub cwd: String,
     pub project_name: String,
     pub started_at: u64,
@@ -325,6 +327,7 @@ mod tests {
             mem_file_count: 0,
             mem_line_count: 0,
             children: Vec::new(),
+            session_name: None,
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
             chat_messages: Vec::new(),

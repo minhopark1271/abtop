@@ -581,6 +581,7 @@ impl App {
                 .unwrap_or(0);
             let has_input = !s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty();
             if has_input
+                && s.session_name.is_none()
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
                 && self.pending_summaries.len() < MAX_SUMMARY_JOBS
@@ -612,6 +613,7 @@ impl App {
     pub fn has_retryable_summaries(&self) -> bool {
         self.sessions.iter().any(|s| {
             (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
+                && s.session_name.is_none()
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
                 && self
@@ -639,6 +641,9 @@ impl App {
 
     fn session_matches(s: &AgentSession, query: &str) -> bool {
         s.project_name.to_lowercase().contains(query)
+            || s.session_name
+                .as_ref()
+                .is_some_and(|name| name.to_lowercase().contains(query))
             || s.model.to_lowercase().contains(query)
             || s.session_id.to_lowercase().contains(query)
             || s.initial_prompt.to_lowercase().contains(query)
@@ -802,10 +807,12 @@ impl App {
         crate::jump::run_jump(target_pid)
     }
 
-    /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
+    /// Get the display summary: user-assigned name > LLM summary > pending > prompt > "—".
     /// Done sessions skip pending state to avoid stuck "..." display.
     pub fn session_summary(&self, session: &AgentSession) -> String {
-        if let Some(summary) = self.summaries.get(&session.session_id) {
+        if let Some(name) = &session.session_name {
+            name.clone()
+        } else if let Some(summary) = self.summaries.get(&session.session_id) {
             summary.clone()
         } else if matches!(session.status, SessionStatus::Done) {
             // Done sessions: don't wait for pending summary, show fallback immediately
@@ -1044,6 +1051,7 @@ mod tests {
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![],
+            session_name: None,
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
             chat_messages: vec![],
@@ -1068,6 +1076,52 @@ mod tests {
             seven_day_window_minutes: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn session_name_overrides_cached_and_pending_summaries() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("codex");
+        session.session_id = "named-session-test".into();
+        session.initial_prompt = "Original task".into();
+        session.session_name = Some("Payment tests".into());
+        app.summaries
+            .insert(session.session_id.clone(), "Old summary".into());
+        app.pending_summaries.insert(session.session_id.clone());
+        assert_eq!(app.session_summary(&session), "Payment tests");
+
+        session.session_name = Some("Renamed task".into());
+        assert_eq!(app.session_summary(&session), "Renamed task");
+        session.session_name = None;
+        assert_eq!(app.session_summary(&session), "Old summary");
+        app.summaries.clear();
+        app.pending_summaries.clear();
+        assert_eq!(app.session_summary(&session), "Original task");
+    }
+
+    #[test]
+    fn named_sessions_are_searchable_and_do_not_start_summary_jobs() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("codex");
+        session.session_id = "named-session-test".into();
+        session.initial_prompt = "Original task".into();
+        session.session_name = Some("Payment tests".into());
+        app.summaries.clear();
+        app.sessions.push(session);
+        app.filter_text = "PAYMENT".into();
+        assert_eq!(app.visible_indices(), vec![0]);
+        assert!(!app.has_retryable_summaries());
+        app.drain_and_retry_summaries();
+        assert!(!app.has_pending_summaries());
+        assert_eq!(app.to_snapshot(2_000).sessions[0].summary, "Payment tests");
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub fn populate_demo(app: &mut App) {
                     text: "Payment code is in place; current pass is tightening test failures around webhook signatures.".into(),
                 },
             ],
+            session_name: None,
             initial_prompt: "Implement Stripe payment integration for checkout flow".into(),
             tool_calls: vec![
                 ToolCall {
@@ -304,6 +305,7 @@ pub fn populate_demo(app: &mut App) {
                     text: "Endpoint is implemented; waiting on your choice for queue priority behavior.".into(),
                 },
             ],
+            session_name: None,
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
@@ -375,6 +377,7 @@ pub fn populate_demo(app: &mut App) {
                     text: "I'll patch middleware order, then run the API smoke tests.".into(),
                 },
             ],
+            session_name: None,
             initial_prompt: "Fix CORS headers and add rate limiting middleware".into(),
             tool_calls: vec![
                 ToolCall {
@@ -464,6 +467,7 @@ pub fn populate_demo(app: &mut App) {
                     text: "Building the component now; next check is responsive canvas sizing.".into(),
                 },
             ],
+            session_name: None,
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
@@ -507,6 +511,7 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             chat_messages: vec![],
+            session_name: None,
             initial_prompt: "Refactor Terraform modules for multi-region".into(),
             tool_calls: vec![],
             pending_since_ms: 0,

@@ -224,6 +224,7 @@ impl OpenCodeCollector {
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,
+                session_name: None,
                 initial_prompt: ds.title.clone(),
                 first_assistant_text: String::new(),
                 chat_messages: vec![],

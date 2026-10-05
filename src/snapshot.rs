@@ -136,8 +136,8 @@ pub struct SessionView {
     pub started_at_ms: u64,
     /// Wall-clock seconds since `started_at_ms`.
     pub elapsed_secs: u64,
-    /// Display summary: cached LLM title if present, else a safe raw-prompt
-    /// fallback. Never triggers summary generation.
+    /// Display summary: user-assigned name, cached LLM title, or a safe
+    /// raw-prompt fallback. Never triggers summary generation.
     pub summary: String,
     /// Most recent current-task line, if any.
     pub current_task: Option<String>,

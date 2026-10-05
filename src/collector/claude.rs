@@ -439,6 +439,9 @@ impl ClaudeCollector {
                     self.transcript_cache.insert(sf.session_id.clone(), delta);
                 } else {
                     // Merge delta into cached result
+                    if delta.saw_session_name {
+                        prev.session_name = delta.session_name;
+                    }
                     if delta.model != "-" {
                         prev.model = delta.model;
                     }
@@ -513,6 +516,8 @@ impl ClaudeCollector {
         }
 
         let empty_result = TranscriptResult {
+            session_name: None,
+            saw_session_name: false,
             model: "-".to_string(),
             total_input: 0,
             total_output: 0,
@@ -678,6 +683,7 @@ impl ClaudeCollector {
             launch_surface,
             pid: sf.pid,
             session_id: sf.session_id,
+            session_name: cached.session_name.clone(),
             cwd: sf.cwd,
             project_name,
             started_at: sf.started_at,
@@ -1242,6 +1248,9 @@ fn find_session_file_for_pid(sessions_dir: &Path, pid: u32) -> Option<PathBuf> {
 }
 
 struct TranscriptResult {
+    session_name: Option<String>,
+    /// Distinguish an explicit empty title from a delta without a rename.
+    saw_session_name: bool,
     model: String,
     total_input: u64,
     total_output: u64,
@@ -1335,6 +1344,8 @@ fn parse_transcript_with_previous(
 ) -> TranscriptResult {
     let identity = file_identity(path);
     let mut result = TranscriptResult {
+        session_name: None,
+        saw_session_name: false,
         model: "-".to_string(),
         total_input: 0,
         total_output: 0,
@@ -1461,6 +1472,15 @@ fn parse_transcript_with_previous(
                         .unwrap_or(0);
 
                     match val.get("type").and_then(|t| t.as_str()) {
+                        Some("custom-title") => {
+                            if let Some(title) = val.get("customTitle").and_then(Value::as_str) {
+                                let title = super::sanitize_terminal_text(title);
+                                let title = title.trim();
+                                result.session_name =
+                                    (!title.is_empty()).then(|| title.to_string());
+                                result.saw_session_name = true;
+                            }
+                        }
                         Some("assistant") => {
                             result.turn_count += 1;
                             // Clear previous task on each new turn so stale tasks
@@ -2167,6 +2187,141 @@ mod tests {
             },
         );
         process_info
+    }
+
+    #[test]
+    fn test_parse_transcript_custom_titles() {
+        for (records, expected) in [
+            (
+                vec![
+                    r#"{"type":"custom-title","customTitle":"First name","sessionId":"test"}"#,
+                    r#"{"type":"custom-title","customTitle":"Latest name","sessionId":"test"}"#,
+                    r#"{"type":"summary","summary":"Generated summary"}"#,
+                    r#"{"type":"custom-title"}"#,
+                    r#"{"type":"custom-title","customTitle":42}"#,
+                ],
+                Some("Latest name"),
+            ),
+            (
+                vec![
+                    r#"{"type":"custom-title","customTitle":"  Fix \u03bb\n\u001b\u202e\u2066  "}"#,
+                ],
+                Some("Fix \u{03bb}"),
+            ),
+            (
+                vec![
+                    r#"{"type":"custom-title","customTitle":"First name"}"#,
+                    r#"{"type":"custom-title","customTitle":" \n\t "}"#,
+                ],
+                None,
+            ),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write_lines(&mut file, &records);
+            let result = parse_transcript(file.path(), 0);
+            assert_eq!(result.session_name.as_deref(), expected);
+            assert!(result.saw_session_name);
+            assert!(!result.saw_turn);
+            assert_eq!(result.turn_count, 0);
+            assert!(result.initial_prompt.is_empty());
+            assert!(result.chat_messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_load_session_tracks_custom_titles_across_refreshes() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let pid = 5253;
+        let session_id = "named-session";
+        let session_path = sessions.join(format!("{pid}.json"));
+        write_session_file(&session_path, pid, session_id, &cwd);
+        let transcript_path = write_transcript(&projects, &cwd, session_id, "Original task");
+        let mut transcript = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(transcript, "{}", r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"Continue"}}"#).unwrap();
+        writeln!(
+            transcript,
+            "{}",
+            r#"{"type":"custom-title","customTitle":"First name","sessionId":"named-session"}"#
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+        let process_info = make_proc_info(pid, "claude");
+        let children_map = HashMap::new();
+        let ports = HashMap::new();
+        let ctx =
+            build_discovery_context(&[(session_path.clone(), config.clone())], &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        let mut load = || {
+            collector
+                .load_session(
+                    &session_path,
+                    &config,
+                    &process_info,
+                    &children_map,
+                    &ports,
+                    &ctx,
+                )
+                .unwrap()
+        };
+        let first = load();
+        assert_eq!(first.session_name.as_deref(), Some("First name"));
+        assert_eq!(first.status, SessionStatus::Thinking);
+
+        // An unchanged file and unrelated metadata must retain the cached name.
+        assert_eq!(load().session_name, first.session_name);
+        writeln!(
+            transcript,
+            "{}",
+            r#"{"type":"summary","summary":"Unrelated metadata"}"#
+        )
+        .unwrap();
+        assert_eq!(load().session_name, first.session_name);
+
+        // A partial append must not replace the name until the JSON is complete.
+        write!(
+            transcript,
+            "{}",
+            r#"{"type":"custom-title","customTitle":"Updated"#
+        )
+        .unwrap();
+        assert_eq!(load().session_name, first.session_name);
+        writeln!(transcript, "{}", r#" name","sessionId":"named-session"}"#).unwrap();
+        let renamed = load();
+        assert_eq!(renamed.session_name.as_deref(), Some("Updated name"));
+        assert_eq!(renamed.status, first.status);
+        assert_eq!(renamed.thinking_since_ms, first.thinking_since_ms);
+        assert_eq!(renamed.turn_count, first.turn_count);
+        assert_eq!(renamed.total_input_tokens, first.total_input_tokens);
+        assert_eq!(load().session_name, renamed.session_name);
+
+        writeln!(
+            transcript,
+            "{}",
+            r#"{"type":"custom-title","customTitle":" "}"#
+        )
+        .unwrap();
+        assert_eq!(load().session_name, None);
+        writeln!(
+            transcript,
+            "{}",
+            r#"{"type":"custom-title","customTitle":"Restored"}"#
+        )
+        .unwrap();
+        assert_eq!(load().session_name.as_deref(), Some("Restored"));
+
+        // Rotation must discard the previous transcript's cached title.
+        fs::write(&transcript_path, "{}\n").unwrap();
+        assert_eq!(load().session_name, None);
     }
 
     #[test]

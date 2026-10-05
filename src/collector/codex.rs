@@ -1,3 +1,4 @@
+use super::codex_names::SessionNameIndex;
 use super::process::{self, ProcInfo};
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 /// - `turn_context`: model, cwd, effort, context window size
 pub struct CodexCollector {
     sessions_dir: PathBuf,
+    session_names: SessionNameIndex,
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
     desktop_recent_scanner: DesktopRecentRolloutScanner,
@@ -110,6 +112,7 @@ impl CodexCollector {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
             sessions_dir: home.join(".codex").join("sessions"),
+            session_names: SessionNameIndex::default(),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         }
@@ -123,6 +126,11 @@ impl CodexCollector {
 
         // Reset live rate limit each pass — only keep it if a current session provides one
         self.last_rate_limit = None;
+
+        if let Some(config_root) = self.sessions_dir.parent() {
+            self.session_names
+                .refresh(&config_root.join("session_index.jsonl"));
+        }
 
         // Step 1: Find running codex processes from shared ps data (no extra ps call).
         // When MCP suppression is on, exclude `codex mcp-server` PIDs — those
@@ -634,6 +642,7 @@ impl CodexCollector {
                 agent_cli: "codex",
                 launch_surface: LaunchSurface::Cli,
                 pid: display_pid,
+                session_name: self.session_names.get(&result.session_id),
                 session_id: result.session_id,
                 cwd: result.cwd,
                 project_name,
@@ -1700,6 +1709,50 @@ mod tests {
         file.set_modified(when).unwrap();
     }
 
+    #[test]
+    fn collector_reads_and_refreshes_names_without_rollout_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let today = sessions_dir.join(chrono::Local::now().format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&today).unwrap();
+        write_jsonl(&today.join("rollout-test.jsonl"), &[SESSION_META]);
+        let index_path = root.path().join("session_index.jsonl");
+        fs::write(
+            &index_path,
+            r#"{"id":"sess-123","thread_name":"First name"}"#,
+        )
+        .unwrap();
+        let mut collector = CodexCollector {
+            sessions_dir,
+            session_names: SessionNameIndex::default(),
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+        };
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_name.as_deref(), Some("First name"));
+        fs::write(
+            &index_path,
+            r#"{"id":"sess-123","thread_name":"Updated name"}"#,
+        )
+        .unwrap();
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions[0].session_name.as_deref(), Some("Updated name"));
+        fs::remove_file(index_path).unwrap();
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions[0].session_name, None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn find_codex_pids_windows_keeps_real_child_over_wrappers() {
@@ -1970,6 +2023,7 @@ mod tests {
 
         let mut collector = CodexCollector {
             sessions_dir: sessions.path().to_path_buf(),
+            session_names: SessionNameIndex::default(),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         };

@@ -61,6 +61,16 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+### Session names (local build)
+
+The Sessions panel's Summary column prefers names assigned with Claude Code or
+Codex `/rename`. Claude Code names are read from `custom-title` transcript records;
+Codex names are read from `session_index.jsonl` next to the Codex `sessions/`
+directory. Names refresh automatically. Press `r` for an immediate refresh.
+Sessions without a name keep the existing summary behavior. The `/`
+session filter also matches these names, and `--once` / `--json` use the same
+display name. No additional configuration is required.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
