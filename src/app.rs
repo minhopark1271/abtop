@@ -804,8 +804,7 @@ impl App {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
-        let target_pid = self.sessions[self.selected].pid;
-        crate::jump::run_jump(target_pid)
+        crate::jump::run_session_jump(&self.sessions[self.selected])
     }
 
     /// Get the display summary: user-assigned name > LLM summary > pending > prompt > "—".

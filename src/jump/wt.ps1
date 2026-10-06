@@ -13,27 +13,41 @@ Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $native = [Abtop.Native]
 $uia = [System.Windows.Automation.AutomationElement]
 
-# A console title is readable only while attached to that console.
-[void]$native::FreeConsole()
-if (-not $native::AttachConsole($targetPid)) { 'NOTAPPLICABLE'; exit }
-$buf = New-Object System.Text.StringBuilder 1024
-[void]$native::GetConsoleTitleW($buf, 1024)
-# Windows Terminal parents each pane's hidden ConPTY window to the window hosting it.
-$hwnd = $native::GetParent($native::GetConsoleWindow())
-[void]$native::FreeConsole()
-if ($hwnd -eq [IntPtr]::Zero) { 'NOTAPPLICABLE'; exit }
-$window = $uia::FromHandle($hwnd)
-if ($window.Current.ClassName -ne 'CASCADIA_HOSTING_WINDOW_CLASS') { 'NOTAPPLICABLE'; exit }
-
-# Agents animate a leading status glyph several times a second; compare without it.
+# Agents animate a leading status glyph several times a second.
 function Normalize($s) { $s -replace '^[^\p{L}\p{N}]+', '' }
-$title = Normalize $buf.ToString()
+if ($env:ABTOP_TARGET_TAB_TITLE) {
+    $title = Normalize $env:ABTOP_TARGET_TAB_TITLE
+    $isTerminal = New-Object System.Windows.Automation.PropertyCondition($uia::ClassNameProperty, 'CASCADIA_HOSTING_WINDOW_CLASS')
+    $windows = @($uia::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $isTerminal))
+} else {
+    # A console title is readable only while attached to that console.
+    [void]$native::FreeConsole()
+    if (-not $native::AttachConsole($targetPid)) { 'NOTAPPLICABLE'; exit }
+    $buf = New-Object System.Text.StringBuilder 1024
+    [void]$native::GetConsoleTitleW($buf, 1024)
+    # Windows Terminal parents each pane's hidden ConPTY window to its host window.
+    $hwnd = $native::GetParent($native::GetConsoleWindow())
+    [void]$native::FreeConsole()
+    if ($hwnd -eq [IntPtr]::Zero) { 'NOTAPPLICABLE'; exit }
+    $window = $uia::FromHandle($hwnd)
+    if ($window.Current.ClassName -ne 'CASCADIA_HOSTING_WINDOW_CLASS') { 'NOTAPPLICABLE'; exit }
+    $windows = @($window)
+    $title = Normalize $buf.ToString()
+}
 $isTab = New-Object System.Windows.Automation.PropertyCondition($uia::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
-$tabs = @($window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $isTab) |
-    Where-Object { $title -and (Normalize $_.Current.Name) -ceq $title })
-if ($tabs.Count -eq 0) { 'NOMATCH'; exit }
-if ($tabs.Count -gt 1) { 'AMBIGUOUS'; exit }
-$tabs[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+$matches = @(
+    foreach ($window in $windows) {
+        foreach ($tab in $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $isTab)) {
+            if ($title -and (Normalize $tab.Current.Name) -ceq $title) {
+                [PSCustomObject]@{ Tab = $tab; Window = $window }
+            }
+        }
+    }
+)
+if ($matches.Count -eq 0) { 'NOMATCH'; exit }
+if ($matches.Count -gt 1) { 'AMBIGUOUS'; exit }
+$matches[0].Tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+$hwnd = [IntPtr]$matches[0].Window.Current.NativeWindowHandle
 if ($native::IsIconic($hwnd)) { [void]$native::ShowWindow($hwnd, 9) }
 [void]$native::SetForegroundWindow($hwnd)
 'JUMPED'

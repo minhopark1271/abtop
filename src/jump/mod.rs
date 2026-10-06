@@ -88,6 +88,27 @@ pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![Box::new(cmux::CmuxJumper), Box::new(tmux::TmuxJumper)]
 }
 
+/// Daemon-backed Codex sessions have no console on the owning server PID.
+pub fn run_session_jump(session: &crate::model::AgentSession) -> JumpOutcome {
+    let outcome = run_jump(session.pid);
+    #[cfg(target_os = "windows")]
+    if matches!(outcome, JumpOutcome::NoOp) && session.agent_cli == "codex" {
+        if let Some(name) = session
+            .session_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            let title = format!("{} | {}", name, session.project_name);
+            return match wt::jump_to_named_tab(&title) {
+                JumpAttempt::Jumped => JumpOutcome::Jumped,
+                JumpAttempt::Failed(message) => JumpOutcome::Failed(format!("wt: {}", message)),
+                JumpAttempt::NotApplicable => JumpOutcome::NoOp,
+            };
+        }
+    }
+    outcome
+}
+
 /// Entry point used by the app: run the selected PID through the registry.
 pub fn run_jump(pid: u32) -> JumpOutcome {
     resolve(&jumpers(), pid)
