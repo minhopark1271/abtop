@@ -3347,6 +3347,27 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             200_000
         );
         assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        // Native 1M models: no [1m] suffix in transcript
+        for m in [
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+        ] {
+            assert_eq!(crate::collector::context_window_for_model(m, "", 0), 1_000_000, "{m}");
+        }
+        // 200K models, including dated ids whose date must not parse as a version
+        for m in [
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert_eq!(crate::collector::context_window_for_model(m, "", 0), 200_000, "{m}");
+        }
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),

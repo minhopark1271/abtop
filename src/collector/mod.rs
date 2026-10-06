@@ -139,14 +139,107 @@ pub struct SharedProcessData {
     pub desktop_rollout_fd_map: HashMap<u32, Vec<PathBuf>>,
 }
 
+/// Models with a native 1M window and no `[1m]` suffix in transcripts:
+/// Fable, Opus 4.7+, Sonnet 5+ (Claude Code changelog). Date suffixes
+/// (`-20251101`) are skipped by accepting only 1-2 digit version parts.
+fn has_native_1m_window(model: &str) -> bool {
+    let mut parts = model.strip_prefix("claude-").unwrap_or(model).split('-');
+    let family = parts.next().unwrap_or("");
+    let mut ver = parts
+        .map_while(|p| (p.len() <= 2).then(|| p.parse::<u32>().ok()).flatten());
+    let major = ver.next().unwrap_or(0);
+    let minor = ver.next().unwrap_or(0);
+    match family {
+        "fable" => true,
+        "opus" => (major, minor) >= (4, 7),
+        "sonnet" => major >= 5,
+        _ => false,
+    }
+}
+
+/// API limits from https://developers.openai.com/api/docs/models.
+/// Codex can configure a smaller window; reported session limits take priority.
+pub(crate) fn openai_context_window_for_model(model: &str) -> Option<u64> {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let limits: &[(&[&str], u64)] = &[
+        (
+            &[
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6.1-sol",
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+            ],
+            1_050_000,
+        ),
+        (&["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"], 1_047_576),
+        (
+            &[
+                "gpt-5.4-mini",
+                "gpt-5.4-nano",
+                "gpt-5.3-codex",
+                "gpt-5.2",
+                "gpt-5.2-pro",
+                "gpt-5.2-codex",
+                "gpt-5.1",
+                "gpt-5.1-codex",
+                "gpt-5.1-codex-mini",
+                "gpt-5.1-codex-max",
+                "gpt-5",
+                "gpt-5-mini",
+                "gpt-5-nano",
+                "gpt-5-pro",
+                "gpt-5-codex",
+            ],
+            400_000,
+        ),
+        (
+            &[
+                "o1",
+                "o3",
+                "o3-mini",
+                "o3-pro",
+                "o4-mini",
+                "codex-mini-latest",
+            ],
+            200_000,
+        ),
+        (&["gpt-4o", "gpt-4o-mini"], 128_000),
+    ];
+    limits.iter().find_map(|(aliases, window)| {
+        aliases
+            .iter()
+            .any(|alias| {
+                model == *alias
+                    || model
+                        .strip_prefix(alias)
+                        .and_then(|suffix| suffix.strip_prefix('-'))
+                        .is_some_and(|date| {
+                            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+                        })
+            })
+            .then_some(*window)
+    })
+}
+
 /// Context window size for this model (e.g. 200K, 1M).
 pub(crate) fn context_window_for_model(
     transcript_model: &str,
     configured_model: &str,
     max_context_tokens: u64,
 ) -> u64 {
+    if let Some(window) = openai_context_window_for_model(transcript_model) {
+        return window;
+    }
     if transcript_model.contains("[1m]")
         || configured_model.contains("[1m]")
+        || has_native_1m_window(transcript_model)
         || max_context_tokens > 200_000
     {
         1_000_000
@@ -519,6 +612,40 @@ impl MultiCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_context_windows_follow_model_limits() {
+        for (model, expected) in [
+            ("gpt-6-astra", 1_050_000),
+            ("gpt-6.1-sol", 1_050_000),
+            ("gpt-6-luna", 1_050_000),
+            ("gpt-5.6-sol", 1_050_000),
+            ("gpt-5.5", 1_050_000),
+            ("openai/gpt-5.4-2026-03-05", 1_050_000),
+            ("gpt-5.4-pro", 1_050_000),
+            ("gpt-5.4-mini", 400_000),
+            ("gpt-5.4-nano", 400_000),
+            ("gpt-5.3-codex", 400_000),
+            ("gpt-5.2-codex", 400_000),
+            ("gpt-5.1-codex-max", 400_000),
+            ("gpt-5-codex", 400_000),
+            ("gpt-4.1-mini", 1_047_576),
+            ("gpt-4o-2024-08-06", 128_000),
+            ("o3", 200_000),
+            ("o4-mini", 200_000),
+            ("codex-mini-latest", 200_000),
+        ] {
+            assert_eq!(context_window_for_model(model, "", 0), expected, "{model}");
+            assert_eq!(
+                context_window_for_model(model, "", 250_000),
+                expected,
+                "{model}"
+            );
+        }
+        for model in ["unknown-model", "gpt-5.4-unknown", "gpt-50", "gpt-7-astra"] {
+            assert_eq!(openai_context_window_for_model(model), None, "{model}");
+        }
+    }
 
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {

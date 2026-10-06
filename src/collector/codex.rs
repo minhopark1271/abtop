@@ -1607,6 +1607,10 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
         return None;
     }
 
+    if result.context_window == 0 {
+        result.context_window = super::openai_context_window_for_model(&result.model).unwrap_or(0);
+    }
+
     result.current_task = pending_tasks
         .last()
         .map(|(_, task)| task.clone())
@@ -2197,6 +2201,55 @@ mod tests {
         assert_eq!(result.last_context_tokens, 151_839);
         assert_eq!(result.context_window, 258_400);
         assert!(result.last_context_tokens < result.context_window);
+    }
+
+    #[test]
+    fn test_codex_context_window_fallback_and_reported_limits() {
+        for (model, reported, expected) in [
+            ("gpt-5.3-codex", None, 400_000),
+            ("gpt-5.5", None, 1_050_000),
+            ("gpt-6-astra", Some(0), 1_050_000),
+            ("gpt-6-astra", Some(258_400), 258_400),
+            ("gpt-5.5", Some(950_000), 950_000),
+            ("unknown-model", None, 0),
+            ("unknown-model", Some(64_000), 64_000),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let turn = serde_json::json!({
+                "type": "turn_context", "payload": {"model": model}
+            });
+            let tokens = serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 100_000},
+                    "model_context_window": reported
+                }}
+            });
+            write_lines(
+                &mut file,
+                &[SESSION_META, &turn.to_string(), &tokens.to_string()],
+            );
+            let collector = CodexCollector::new();
+            let (session, _) = collector
+                .load_session_with_rate_limit(
+                    host_process(99),
+                    file.path(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .unwrap();
+            assert_eq!(session.context_window, expected, "{model}, {reported:?}");
+            let percent = if expected == 0 {
+                0.0
+            } else {
+                100_000.0 / expected as f64 * 100.0
+            };
+            assert!(
+                (session.context_percent - percent).abs() < 1e-9,
+                "{model}, {reported:?}"
+            );
+        }
     }
 
     #[test]
