@@ -1,6 +1,8 @@
 use super::process::{self, ProcInfo};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+#[cfg(any(test, not(target_os = "windows")))]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 use std::process::{Command, Stdio};
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
@@ -227,31 +229,8 @@ pub(crate) fn map_pid_to_rollouts(pids: &[u32]) -> HashMap<u32, Vec<PathBuf>> {
 
     #[cfg(target_os = "windows")]
     {
-        let mut sys = sysinfo::System::new();
-        let pids_sys: Vec<sysinfo::Pid> = pids
-            .iter()
-            .copied()
-            .map(|p| sysinfo::Pid::from(p as usize))
-            .collect();
-        sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&pids_sys),
-            true,
-            sysinfo::ProcessRefreshKind::new().with_memory(),
-        );
-        for &pid_u32 in pids {
-            let pid = sysinfo::Pid::from(pid_u32 as usize);
-            if let Some(proc_) = sys.process(pid) {
-                if let Some(cwd) = proc_.cwd() {
-                    if let Ok(entries) = std::fs::read_dir(cwd) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if is_rollout_path(&p) {
-                                map.entry(pid_u32).or_default().push(p);
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(home) = dirs::home_dir() {
+            map = process::windows_rollout_owners(&home.join(".codex/sessions"), pids);
         }
     }
 
@@ -379,6 +358,7 @@ pub(crate) fn parse_lsof_rollout_output(stdout: &str) -> HashMap<u32, Vec<PathBu
     map
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn is_rollout_path(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())

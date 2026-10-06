@@ -497,6 +497,95 @@ fn windows_command_tokens(cmd: &str) -> Vec<String> {
     tokens
 }
 
+#[cfg(target_os = "windows")]
+fn file_owner_pids(path: &std::path::Path) -> Vec<u32> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+    #[repr(C)]
+    struct Owners {
+        count: u32,
+        pids: [usize; 256],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationFile(
+            file: *mut std::ffi::c_void,
+            io_status: *mut usize,
+            information: *mut Owners,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .access_mode(0x80) // FILE_READ_ATTRIBUTES
+        .share_mode(7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        .open(path)
+    else {
+        return Vec::new();
+    };
+    let mut owners = Owners {
+        count: 0,
+        pids: [0; 256],
+    };
+    let mut io_status = [0usize; 2];
+    // FileProcessIdsUsingFileInformation (47), with pointer-aligned PID entries.
+    // https://github.com/winsiderss/phnt/blob/master/ntioapi.h
+    // SAFETY: the handle stays open and both output buffers have the native ABI layout.
+    let status = unsafe {
+        NtQueryInformationFile(
+            file.as_raw_handle(),
+            io_status.as_mut_ptr(),
+            &mut owners,
+            std::mem::size_of::<Owners>() as u32,
+            47,
+        )
+    };
+    if status != 0 || owners.count as usize > owners.pids.len() {
+        return Vec::new();
+    }
+    owners.pids[..owners.count as usize]
+        .iter()
+        .filter_map(|&pid| u32::try_from(pid).ok())
+        .filter(|&pid| pid != std::process::id())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_rollout_owners(
+    root: &std::path::Path,
+    pids: &[u32],
+) -> HashMap<u32, Vec<std::path::PathBuf>> {
+    let mut result: HashMap<u32, Vec<std::path::PathBuf>> = HashMap::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(dir) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                    continue;
+                }
+                let path = entry.path();
+                for pid in file_owner_pids(&path) {
+                    if pids.contains(&pid) {
+                        result.entry(pid).or_default().push(path.clone());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
     // Validate cwd is an existing directory before running git
     if !std::path::Path::new(cwd).is_dir() {
@@ -593,6 +682,43 @@ mod tests {
             r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile "C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js""#,
             "codex",
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_rollout_owners_queries_handles_instead_of_timestamps() {
+        use std::io::{BufRead, BufReader};
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("2020/01/01");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let owned = old_dir.join("rollout-owned.jsonl");
+        std::fs::write(&owned, "").unwrap();
+        let unrelated = root.path().join("rollout-unrelated.jsonl");
+        std::fs::write(&unrelated, "").unwrap();
+
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$f = [IO.File]::OpenRead($env:ABTOP_TEST_ROLLOUT); [Console]::WriteLine('ready'); [Console]::ReadLine() | Out-Null; $f.Dispose()"])
+            .env("ABTOP_TEST_ROLLOUT", &owned)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn().unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let child_pid = child.id();
+        let owners = windows_rollout_owners(root.path(), &[child_pid]);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+
+        assert_eq!(ready.trim(), "ready");
+        assert_eq!(owners.get(&child_pid), Some(&vec![owned]));
+        assert!(windows_rollout_owners(root.path(), &[child_pid]).is_empty());
     }
 
     fn proc(pid: u32, ppid: u32) -> ProcInfo {

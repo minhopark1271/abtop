@@ -137,21 +137,35 @@ impl CodexCollector {
         // are surfaced through the MCP servers panel instead. See issue #95.
         let codex_pids =
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
+        #[cfg(not(target_os = "windows"))]
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        #[cfg(not(target_os = "windows"))]
+        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids);
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
+        #[cfg(target_os = "windows")]
+        let pid_to_jsonl: Vec<(u32, PathBuf)> = shared
+            .desktop_rollout_fd_map
+            .iter()
+            .filter(|(pid, _)| {
+                shared.process_info.contains_key(pid) && !shared.mcp_server_pids.contains(pid)
+            })
+            .flat_map(|(&pid, paths)| paths.iter().cloned().map(move |path| (pid, path)))
+            .collect();
 
         let mut sessions = Vec::new();
         let mut seen_jsonl = std::collections::HashSet::new();
 
         // Active sessions: running codex processes with open JSONL files
         for (pid, jsonl_path) in &pid_to_jsonl {
+            if seen_jsonl.contains(jsonl_path) || shared.mcp_owned_rollouts.contains(jsonl_path) {
+                continue;
+            }
             let is_exec = pid_is_exec.get(pid).copied().unwrap_or(false);
             if let Some((session, rl)) = self.load_session_with_rate_limit(
                 CodexProcessContext {
                     pid: Some(*pid),
                     is_exec,
-                    owns_process_tree: true,
+                    owns_process_tree: pid_is_exec.contains_key(pid),
                     unknown_process_owner: false,
                 },
                 jsonl_path,
@@ -280,8 +294,8 @@ impl CodexCollector {
             }
         }
 
-        // Recently finished sessions: scan today's JSONL files not owned by any running process.
-        // This ensures Codex sessions transition to Done instead of vanishing.
+        // Keep recent unowned rollouts visible. Windows cannot establish ownership,
+        // so these remain Unknown rather than being marked Done.
         if let Some(recent_dir) = Self::today_session_dir(&self.sessions_dir) {
             if let Ok(entries) = fs::read_dir(&recent_dir) {
                 for entry in entries.flatten() {
@@ -320,7 +334,7 @@ impl CodexCollector {
                             pid: None,
                             is_exec: false,
                             owns_process_tree: false,
-                            unknown_process_owner: false,
+                            unknown_process_owner: cfg!(target_os = "windows"),
                         },
                         &path,
                         &shared.process_info,
@@ -543,6 +557,18 @@ impl CodexCollector {
         ports: &HashMap<u32, Vec<u16>>,
     ) -> Option<(AgentSession, Option<RateLimitInfo>)> {
         let result = parse_codex_jsonl(jsonl_path)?;
+        // Desktop hosts retain open historical rollouts; a handle alone is not activity.
+        if !process_ctx.owns_process_tree && result.is_codex_desktop() {
+            let age = fs::metadata(jsonl_path)
+                .ok()?
+                .modified()
+                .ok()?
+                .elapsed()
+                .unwrap_or_default();
+            if age.as_secs() >= super::mcp::ACTIVE_MTIME_SECS {
+                return None;
+            }
+        }
 
         let proc = process_ctx.pid.and_then(|p| process_info.get(&p));
         let mem_mb = if process_ctx.owns_process_tree {
@@ -691,7 +717,7 @@ impl CodexCollector {
     /// Returns (pid, is_exec) tuples — `is_exec` is true for one-shot `codex exec` runs.
     /// PIDs in `mcp_server_pids` are skipped so `codex mcp-server` processes
     /// are reported via the MCP servers panel instead.
-    fn find_codex_pids_from_shared(
+    pub(crate) fn find_codex_pids_from_shared(
         process_info: &HashMap<u32, ProcInfo>,
         mcp_server_pids: &HashSet<u32>,
     ) -> Vec<(u32, bool)> {
@@ -710,9 +736,7 @@ impl CodexCollector {
 
         // Windows npm/Git shims can create a chain like:
         // sh.exe -> node.exe ...\codex.js -> codex.exe.
-        // Once the real codex child exists, keep that child and drop wrapper
-        // ancestors; otherwise Windows rollout fallback maps each candidate PID
-        // to a different recent JSONL file and historical sessions look live.
+        // Keep the real codex child rather than counting wrapper ancestors as agents.
         let candidates = pids.clone();
         pids.retain(|(pid, _)| {
             process::cmd_first_token_has_binary(
@@ -755,15 +779,9 @@ impl CodexCollector {
     /// Map codex PIDs to their open rollout-*.jsonl files.
     ///
     /// On Linux, scans /proc/{pid}/fd symlinks directly (no process spawn).
-    /// On Windows, scans ~/.codex/sessions/YYYY/MM/DD/ for recently modified
-    /// JSONL files and assigns them to discovered PIDs, since Windows has no
-    /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
-    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
-        // sessions_dir is consumed only by the windows arm below.
-        #[cfg(not(target_os = "windows"))]
-        let _ = sessions_dir;
-
+    #[cfg(not(target_os = "windows"))]
+    fn map_pid_to_jsonl(pids: &[u32]) -> HashMap<u32, PathBuf> {
         let mut map = HashMap::new();
         if pids.is_empty() {
             return map;
@@ -783,45 +801,6 @@ impl CodexCollector {
                     }
                 }
             }
-            map
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
-            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
-            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
-            // Prefer recently modified files, but fall back to any today's file
-            // since Codex may be idle (waiting for input) and not actively writing.
-            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
-                if let Ok(entries) = fs::read_dir(&today_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                            continue;
-                        }
-                        if let Ok(meta) = fs::metadata(&path) {
-                            if let Ok(modified) = meta.modified() {
-                                candidates.push((path, modified));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Sort by modification time descending (most recent first)
-            candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-            // Assign candidates to PIDs (most recent file → first PID)
-            for (i, &pid_u32) in pids.iter().enumerate() {
-                if i < candidates.len() {
-                    map.insert(pid_u32, candidates[i].0.clone());
-                }
-            }
-
             map
         }
 
@@ -2009,6 +1988,124 @@ mod tests {
         assert_eq!(sessions[0].status, SessionStatus::Waiting);
         assert_eq!(sessions[0].mem_mb, 0);
         assert!(sessions[0].children.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_recent_rollouts_do_not_borrow_live_cli_pids() {
+        let root = tempfile::tempdir().unwrap();
+        let today = root
+            .path()
+            .join(chrono::Local::now().format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&today).unwrap();
+        let cli = today.join("rollout-cli.jsonl");
+        let desktop = today.join("rollout-desktop.jsonl");
+        write_jsonl(
+            &cli,
+            &[
+                r#"{"type":"session_meta","payload":{"id":"cli","cwd":"C:/cli","originator":"codex_cli_rs"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"CLI conversation"}}"#,
+            ],
+        );
+        write_jsonl(
+            &desktop,
+            &[
+                r#"{"type":"session_meta","payload":{"id":"desktop","cwd":"C:/desktop","originator":"codex_desktop"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"Unrelated desktop conversation"}}"#,
+            ],
+        );
+        let mut collector = CodexCollector {
+            sessions_dir: root.path().to_path_buf(),
+            session_names: SessionNameIndex::default(),
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+        };
+        let mut shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+        shared
+            .process_info
+            .insert(42, proc_info(42, 1, "codex.exe"));
+        shared
+            .process_info
+            .insert(43, proc_info(43, 1, "codex.exe"));
+        for latest in [&cli, &desktop] {
+            set_modified(latest, std::time::SystemTime::now());
+            let sessions = collector.collect_sessions(&shared);
+            assert_eq!(sessions.len(), 2);
+            for session in &sessions {
+                assert_eq!(session.pid, 0);
+                assert_eq!(session.status, SessionStatus::Unknown);
+                assert!(session.children.is_empty());
+            }
+            assert!(sessions.iter().any(|s| s.session_id == "cli"));
+            assert!(sessions.iter().any(|s| s.session_id == "desktop"));
+        }
+
+        // A daemon can own a CLI rollout created on an earlier day and idle for hours.
+        let old_dir = root.path().join("2020/01/01");
+        fs::create_dir_all(&old_dir).unwrap();
+        let old_cli = old_dir.join("rollout-cli.jsonl");
+        fs::rename(&cli, &old_cli).unwrap();
+        set_modified(&old_cli, SystemTime::now() - Duration::from_secs(86_400));
+        shared.process_info.insert(
+            99,
+            proc_info(99, 1, "codex.exe app-server --managed-daemon"),
+        );
+        shared
+            .desktop_rollout_fd_map
+            .insert(99, vec![old_cli.clone()]);
+        let sessions = collector.collect_sessions(&shared);
+        let session = sessions.iter().find(|s| s.session_id == "cli").unwrap();
+        assert_eq!(session.pid, 99);
+        assert_ne!(session.status, SessionStatus::Unknown);
+        assert_ne!(session.status, SessionStatus::Done);
+        assert!(session.children.is_empty());
+        assert_eq!(sessions.iter().filter(|s| s.session_id == "cli").count(), 1);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.session_id == "desktop")
+                .unwrap()
+                .pid,
+            0
+        );
+
+        // Desktop app servers retain historical files after a conversation ends.
+        write_jsonl(&desktop, &[DESKTOP_SESSION_META]);
+        set_modified(&desktop, SystemTime::now() - Duration::from_secs(86_400));
+        shared
+            .desktop_rollout_fd_map
+            .get_mut(&99)
+            .unwrap()
+            .push(desktop.clone());
+        let sessions = collector.collect_sessions(&shared);
+        assert!(sessions.iter().any(|s| s.session_id == "cli"));
+        assert!(!sessions.iter().any(|s| s.session_id == "desktop-123"));
+        set_modified(&desktop, SystemTime::now());
+        let sessions = collector.collect_sessions(&shared);
+        assert!(sessions.iter().any(|s| s.session_id == "desktop-123"));
+
+        // The same verified mapping also supports a standalone CLI process.
+        shared.desktop_rollout_fd_map.clear();
+        shared.desktop_rollout_fd_map.insert(42, vec![old_cli]);
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(
+            sessions.iter().find(|s| s.session_id == "cli").unwrap().pid,
+            42
+        );
+
+        // Ignore cached ownership once the process disappears.
+        shared.process_info.remove(&42);
+        let sessions = collector.collect_sessions(&shared);
+        assert!(!sessions.iter().any(|s| s.session_id == "cli"));
     }
 
     #[test]

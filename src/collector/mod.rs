@@ -409,6 +409,21 @@ impl MultiCollector {
                 &shared.process_info,
                 &shared.mcp_server_pids,
             );
+            #[cfg(target_os = "windows")]
+            let desktop_pids = {
+                let mut pids = desktop_pids;
+                pids.extend(
+                    CodexCollector::find_codex_pids_from_shared(
+                        &shared.process_info,
+                        &shared.mcp_server_pids,
+                    )
+                    .into_iter()
+                    .map(|(pid, _)| pid),
+                );
+                pids.sort_unstable();
+                pids.dedup();
+                pids
+            };
             shared.desktop_rollout_fd_map = self.desktop_rollout_scanner.update(&desktop_pids);
         }
 
